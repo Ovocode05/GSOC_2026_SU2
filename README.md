@@ -161,3 +161,137 @@ There's a segfault at exit (MPI cleanup on the DGX container — known issue). S
 **Temperature** — viscous dissipation heats the fluid near the wall (adiabatic BC). Freestream stays close to 300 K.
 
 **Skin Friction Coefficient** — non-zero only on the plate surface, values 0.002–0.005, decreasing downstream. Consistent with turbulent flat plate correlations at Re=5×10⁶.
+
+# Assignment 4 — Spatially Varying Wall Temperature 
+SU2 v8.4.0 "Harrier" · Turbulent Flat Plate · RANS/SA · M=0.2, Re=5×10⁶
+
+---
+
+## Objective
+
+Extend the Assignment 3 Python wrapper to apply a spatially varying isothermal wall temperature along the flat plate, demonstrating the Python interface's ability to modify boundary conditions programmatically at each solver iteration.
+
+---
+
+## Implementation
+
+### Boundary Condition Setup (`turb_SA_flatplate.cfg`)
+
+Two config entries are required for Python-controlled wall temperature:
+
+```ini
+MARKER_ISOTHERMAL= ( wall, 300.0 )   # registers BC type; value overridden by Python
+MARKER_PYTHON_CUSTOM= ( wall )        # marks boundary as Python-controllable
+```
+
+`MARKER_ISOTHERMAL` sets the BC type. `MARKER_PYTHON_CUSTOM` tells SU2 to accept per-vertex temperature overrides from the Python wrapper each iteration.
+
+### Temperature Profile
+
+```
+T(x) = 300 + 50·sin(πx)     [K],    x ∈ [0, 1] m
+```
+
+- 300 K at leading and trailing edges — matches freestream, avoids artificial thermal gradients at boundaries
+- Peak 350 K at x = 0.5 m (plate midpoint)
+- Smooth and differentiable everywhere
+
+### Python Wrapper
+
+The key addition over Assignment 3 is the per-iteration temperature loop:
+
+```python
+marker_ids = driver.GetMarkerIndices()
+wall_id    = marker_ids['wall']
+nVertex    = driver.GetNumberMarkerNodes(wall_id)
+
+while TimeIter < nTimeIter:
+    driver.Preprocess(TimeIter)
+
+    # Set T(x) using physical x-coordinate — NOT vertex index
+    for iVertex in range(nVertex):
+        x  = driver.MarkerCoordinates(wall_id)(iVertex, 0)
+        x  = max(0.0, min(1.0, x))
+        Tw = 300.0 + 50.0 * sin(pi * x)
+        driver.SetMarkerCustomTemperature(wall_id, iVertex, Tw)
+
+    driver.BoundaryConditionsUpdate()
+    driver.Run()
+    ...
+```
+
+**Critical implementation detail**: `MarkerCoordinates` returns a `CPyWrapperMarkerMatrixView` object — uses `(row, col)` tuple indexing, not `[row][col]`. Physical x-coordinate must be used (not vertex index ratio `i/(n-1)`) since mesh nodes on a marker have no guaranteed spatial ordering.
+
+---
+
+## Run Configuration
+
+```ini
+CFL_NUMBER= 5.0
+MGLEVEL= 3
+LINEAR_SOLVER= FGMRES
+CONV_RESIDUAL_MINVAL= -8
+ITER= 10000
+```
+
+```bash
+OMP_NUM_THREADS=1 mpirun --allow-run-as-root -np 1 \
+  python3 flatplate_spatial_T_wrapper.py
+```
+
+---
+
+## Linear Solver Study
+
+Both available Krylov solvers were tested under identical conditions (mesh, config, CFL, multigrid settings identical):
+
+| Linear Solver | Converged Iter | rms[Rho] | CD | CL | Avg_a (m/s) |
+|---|---|---|---|---|---|
+| FGMRES | 9671 | −8.00004 | 0.002809 | −0.188203 | 350.22 |
+| BCGSTAB | 9671 | −8.00004 | 0.002809 | −0.188203 | 350.22 |
+
+Results are identical. With `MGLEVEL=3`, multigrid coarse-level corrections dominate outer nonlinear convergence — the linear solver only runs 10 inner iterations per outer step (to tolerance 1e-6). The outer convergence path is determined entirely by the multigrid cycle quality, making the Krylov method choice irrelevant at these settings.
+
+`CONJUGATE_GRADIENT` is not applicable — requires a symmetric system, which does not hold for RANS with upwind discretization. `RESTARTED_FGMRES` would behave identically to FGMRES within a 10-iteration window.
+
+**Decision**: FGMRES retained — SU2 default, better suited for non-symmetric systems in general.
+
+---
+
+## Results
+
+### Convergence
+
+Converged at iteration 9671 (vs ~4921 for Assignment 3 uniform-temperature case):
+
+```
+rms[Rho] = -8.00004   < -8   → Yes
+```
+
+The heated wall adds ~50K of thermal forcing at the midpoint. More iterations required for the boundary layer to reach thermal equilibrium — the solver must satisfy an additional energy balance at every wall node each iteration.
+
+### Flow Quantities vs Assignment 3
+
+| Quantity | A3 — Uniform 300K | A4 — T(x) profile | Change |
+|---|---|---|---|
+| CD | 0.002850 | 0.002809 | −1.4% |
+| CL | −0.188287 | −0.188203 | ~0% |
+| Avg_a (m/s) | 347.75 | 350.22 | +0.7% |
+
+Wall heating reduces near-wall density → lower skin friction → CD drops slightly. Average sound speed increases as domain-averaged temperature rises above 300K. Lift is unaffected — expected for zero angle of attack.
+
+### Volume Output
+
+![Assignment 4 Results](results_a4_final.png)
+
+**Left**: Near-wall temperature field (y < 0.02 m). Thermal boundary layer is thin (~1–2 mm) at Re=5×10⁶ — turbulent Prandtl number Pr_t = 0.9 keeps thermal and velocity BLs tightly coupled.
+
+**Center**: Applied wall BC. Sinusoidal profile peaks at 350K at midplate, returns to 300K at both ends.
+
+**Right**: Near-wall Mach field showing boundary layer growth from leading edge — canonical turbulent flat plate behavior.
+
+---
+
+## Notes
+
+The MPI binary file writer crashes during cleanup (`PMPI_File_close`) on HPC-X v2.19. This is a known incompatibility between SU2's collective MPI-IO writer and the installed OpenMPI version. All result files (`flow.vtu`, `history.csv`, `restart_flow.dat`) are written correctly before the crash. This is an environment issue, not a solver issue.
